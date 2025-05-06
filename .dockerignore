@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+.git
+.gitignore
+temp/
+*.mp4
+*.json
+!package.json
+!package-lock.json 
