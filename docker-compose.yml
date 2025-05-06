@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  video-api:
+    build: .
+    ports:
+      - "3000:3000"
+    container_name: video-api-container
+    # If you need to set environment variables, you can do it here:
+    # environment:
+    #   - NODE_ENV=production
+    #   - PORT=3000 
+    # If your application needs to write to persistent storage or access host directories:
+    # volumes:
+    #   - ./some-data:/usr/src/app/data 
