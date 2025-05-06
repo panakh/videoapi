@@ -182,14 +182,16 @@ Initiating cleanup for request ${requestId}...`);
 
         // --- 3. Calculate Timeline --- 
         const timedSegments = [];
-        let lastEndTime = 0;
+        let lastCalculatedEndTime = 0; // Use a clearer name for the running end time
         const defaultFixedDuration = 5.0;
         // Use the root-level transcript here
         // const transcript = firstSegment.transcript; // No longer needed here
 
+        console.log("--- Initial Segment Timing Calculation ---");
         for (let i = 0; i < segments.length; i++) {
             const segment = segments[i];
-            const durationMode = segment.durationMode || 'fixed';
+            // Inherit durationMode correctly
+            const durationMode = (segment.durationMode || req.body.durationMode || 'fixed');
             let segmentTiming = {
                 display_start_time: 0,
                 display_end_time: 0,
@@ -197,73 +199,90 @@ Initiating cleanup for request ${requestId}...`);
                 speech_duration: 0,
                 index: i
             };
+            let textFound = false; // Flag to track if dynamic search worked
+            let wordSequence = null; // Store wordSequence result
 
-            if (durationMode === 'dynamic') {
-                if (!segment.textOnScreen) {
-                     console.warn(`Segment ${i} is dynamic but missing textOnScreen. Falling back to fixed duration.`);
-                     segmentTiming.display_start_time = lastEndTime;
-                     segmentTiming.effective_visual_duration = defaultFixedDuration; 
-                     segmentTiming.display_end_time = lastEndTime + segmentTiming.effective_visual_duration;
-                     segmentTiming.speech_duration = segmentTiming.effective_visual_duration;
+            if (durationMode === 'dynamic' && segment.textOnScreen) {
+                wordSequence = findWordSequence(transcript, segment.textOnScreen);
+                if (wordSequence) {
+                    segmentTiming.display_start_time = Math.max(0, wordSequence.startTime);
+                    segmentTiming.speech_duration = wordSequence.duration;
+                    // Tentative end time based on speech
+                    segmentTiming.display_end_time = Math.max(segmentTiming.display_start_time + 0.1, wordSequence.endTime); 
+                    segmentTiming.effective_visual_duration = segmentTiming.display_end_time - segmentTiming.display_start_time;
+                    textFound = true;
+                     console.log(`Segment ${i} (dynamic-found): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}, VisualDur=${segmentTiming.effective_visual_duration.toFixed(3)}, SpeechDur=${segmentTiming.speech_duration.toFixed(3)}`);
                 } else {
-                    // Pass the root-level transcript to findWordSequence
-                    const wordSequence = findWordSequence(transcript, segment.textOnScreen);
-                    if (!wordSequence) {
-                        console.warn(`Could not find text "${segment.textOnScreen}" for dynamic segment ${i}. Falling back to fixed duration.`);
-                         segmentTiming.display_start_time = lastEndTime;
-                         segmentTiming.effective_visual_duration = defaultFixedDuration; 
-                         segmentTiming.display_end_time = lastEndTime + segmentTiming.effective_visual_duration;
-                         segmentTiming.speech_duration = segmentTiming.effective_visual_duration;
-                    } else {
-                        segmentTiming.display_start_time = Math.max(0, wordSequence.startTime);
-                        segmentTiming.speech_duration = wordSequence.duration;
-                        let nextStartTime = audioDuration;
-                        for (let j = i + 1; j < segments.length; j++) {
-                             const nextSegment = segments[j];
-                             if (nextSegment.durationMode === 'dynamic' && nextSegment.textOnScreen) {
-                                // Pass the root-level transcript here too
-                                const nextWordSequence = findWordSequence(transcript, nextSegment.textOnScreen);
-                                if (nextWordSequence) {
-                                    nextStartTime = nextWordSequence.startTime;
-                                    break;
-                                }
-                             }
-                        }
-                        segmentTiming.display_end_time = nextStartTime;
-                        segmentTiming.effective_visual_duration = Math.max(0.1, segmentTiming.display_end_time - segmentTiming.display_start_time);
-                    }
+                    console.warn(`Could not find text "${segment.textOnScreen}" for dynamic segment ${i}. Falling back to fixed logic.`);
+                    // Fall through to fixed logic below
                 }
-            } else { // Fixed mode
-                const fixedDuration = parseFloat(segment.durationOnScreen) || defaultFixedDuration;
-                segmentTiming.display_start_time = lastEndTime;
-                segmentTiming.effective_visual_duration = fixedDuration;
-                segmentTiming.display_end_time = lastEndTime + fixedDuration;
-                segmentTiming.speech_duration = fixedDuration;
-                lastEndTime = segmentTiming.display_end_time;
+            }
+
+            // Apply fixed logic if mode is 'fixed' OR if dynamic failed
+            if (durationMode === 'fixed' || !textFound) {
+                 const fixedDuration = parseFloat(segment.durationOnScreen) || defaultFixedDuration;
+                 // Start after the last segment ended (using the running end time)
+                 segmentTiming.display_start_time = lastCalculatedEndTime; 
+                 segmentTiming.effective_visual_duration = fixedDuration;
+                 segmentTiming.display_end_time = segmentTiming.display_start_time + fixedDuration;
+                 segmentTiming.speech_duration = fixedDuration; // Keep speech duration same as visual for fixed
+                 console.log(`Segment ${i} (${durationMode}${!textFound ? '-fallback' : ''}): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}, VisualDur=${segmentTiming.effective_visual_duration.toFixed(3)}`);
             }
             
-             if (i === segments.length - 1) {
-                segmentTiming.display_end_time = audioDuration;
-                segmentTiming.effective_visual_duration = Math.max(0.1, segmentTiming.display_end_time - segmentTiming.display_start_time);
-                 if (durationMode === 'fixed') {
-                     segmentTiming.speech_duration = segmentTiming.effective_visual_duration;
-                 }
-            }
+            // Update the running end time for the *next* segment's fixed/fallback calculation
+            lastCalculatedEndTime = segmentTiming.display_end_time; 
 
             timedSegments.push(segmentTiming);
-            console.log(`Segment ${i} (${durationMode}): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}, VisualDur=${segmentTiming.effective_visual_duration.toFixed(3)}, SpeechDur=${segmentTiming.speech_duration.toFixed(3)}`);
-             lastEndTime = segmentTiming.display_end_time;
-        }
-        
-         for (let i = 1; i < timedSegments.length; i++) {
-            if (timedSegments[i].display_start_time < timedSegments[i-1].display_end_time) {
+        } // End of first loop
+
+        console.log("--- Post-processing Timings (Overlap, Last Segment) ---");
+        // --- Post-processing Loop for Overlaps and Final Segment --- 
+        for (let i = 0; i < timedSegments.length; i++) {
+            // Determine again if the original intent was dynamic and successful
+            const segment = segments[i]; 
+            const durationMode = (segment.durationMode || req.body.durationMode || 'fixed');
+            const wasDynamicSuccess = (durationMode === 'dynamic' && segment.textOnScreen && findWordSequence(transcript, segment.textOnScreen));
+
+            // 1. Correct Overlaps based on previous segment's END time
+            if (i > 0 && timedSegments[i].display_start_time < timedSegments[i - 1].display_end_time) {
                 console.warn(`Correcting overlap: Segment ${i} start time ${timedSegments[i].display_start_time.toFixed(3)} adjusted to ${timedSegments[i-1].display_end_time.toFixed(3)}`);
-                timedSegments[i].display_start_time = timedSegments[i-1].display_end_time;
+                timedSegments[i].display_start_time = timedSegments[i - 1].display_end_time;
+                
+                // Recalculate end time and visual duration based on the adjusted start
+                if (wasDynamicSuccess) {
+                     // Keep original end time if dynamic, just recalculate visual duration
+                     timedSegments[i].effective_visual_duration = Math.max(0.1, timedSegments[i].display_end_time - timedSegments[i].display_start_time);
+                } else {
+                     // If fixed or fallback, recalculate end time based on original fixed duration
+                      const fixedDuration = timedSegments[i].effective_visual_duration; // Preserve the initially calculated fixed duration
+                      timedSegments[i].display_end_time = timedSegments[i].display_start_time + fixedDuration;
+                }
+            }
+
+            // 2. Ensure minimum visual duration (redundant check after overlap potentially useful)
+            timedSegments[i].effective_visual_duration = Math.max(0.1, timedSegments[i].effective_visual_duration);
+            // Ensure end time respects minimum duration if start time was pushed
+            timedSegments[i].display_end_time = Math.max(timedSegments[i].display_end_time, timedSegments[i].display_start_time + 0.1);
+
+            // 3. Adjust LAST segment to fill audio duration
+            if (i === timedSegments.length - 1) {
+                // Only extend the end time if it doesn't already reach the end
+                if (timedSegments[i].display_end_time < audioDuration) {
+                    console.log(`Adjusting last segment end time from ${timedSegments[i].display_end_time.toFixed(3)} to ${audioDuration.toFixed(3)}`);
+                    timedSegments[i].display_end_time = audioDuration;
+                } 
+                 // Ensure the final end time does not exceed audio duration
+                 timedSegments[i].display_end_time = Math.min(timedSegments[i].display_end_time, audioDuration);
+                 // Recalculate final visual duration
                 timedSegments[i].effective_visual_duration = Math.max(0.1, timedSegments[i].display_end_time - timedSegments[i].display_start_time);
-                if (segments[i].durationMode === 'fixed') {
+                
+                // Update speech duration only if it wasn't dynamically set based on text
+                if (!wasDynamicSuccess) {
                      timedSegments[i].speech_duration = timedSegments[i].effective_visual_duration;
                 }
             }
+            // Final log after corrections for this segment
+            console.log(`Segment ${i} (Final): Start=${timedSegments[i].display_start_time.toFixed(3)}, End=${timedSegments[i].display_end_time.toFixed(3)}, VisualDur=${timedSegments[i].effective_visual_duration.toFixed(3)}, SpeechDur=${timedSegments[i].speech_duration.toFixed(3)}`);
         }
 
         // --- 4. Generate Subtitles --- 
