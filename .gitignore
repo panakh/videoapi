@@ -107,3 +107,4 @@ dist
 # Video API specific
 temp/
 generated_video.mp4 
+data
