@@ -280,14 +280,14 @@ Initiating cleanup for request ${requestId}...`);
         let subtitlesPath = null;
         if (transcript && transcript.length > 0) {
             subtitlesPath = path.join(tempDir, 'subtitles.ass');
-            try {
-                 // Use the root-level transcript
-                 const assContent = generateAssSubtitles(transcript);
-                 await fs.writeFile(subtitlesPath, assContent);
-                 console.log(`Generated ASS subtitles: ${subtitlesPath}`);
-            } catch (subError) {
-                 console.error("Error generating subtitles:", subError);
-                 console.warn("Proceeding without subtitles due to generation error.");
+        try {
+             // Use the root-level transcript
+             const assContent = generateAssSubtitles(transcript);
+             await fs.writeFile(subtitlesPath, assContent);
+             console.log(`Generated ASS subtitles: ${subtitlesPath}`);
+        } catch (subError) {
+             console.error("Error generating subtitles:", subError);
+             console.warn("Proceeding without subtitles due to generation error.");
             }
         } else {
             console.log("No transcript data found, skipping subtitle generation.");
@@ -341,9 +341,49 @@ Initiating cleanup for request ${requestId}...`);
 
                 const chunkGlobalStartTime = timedSegments[firstSegmentOriginalIndex].display_start_time;
                 // Use the end time of the *last* segment in the batch for audio end time
-                const chunkGlobalEndTime = timedSegments[lastSegmentOriginalIndex].display_end_time; 
+                // const chunkGlobalEndTime = timedSegments[lastSegmentOriginalIndex].display_end_time; 
+                // --- MODIFIED chunkGlobalEndTime calculation ---
+                let chunkGlobalEndTime;
+
+                // Determine the original index of the first segment of the *next* batch/segment
+                let nextSegmentOriginalIndex = -1;
+                if (i + CHUNK_SIZE < collectedSegmentParameters.length) { // Is there a next batch?
+                    nextSegmentOriginalIndex = collectedSegmentParameters[i + CHUNK_SIZE].originalIndex;
+                } else if (lastSegmentOriginalIndex + 1 < timedSegments.length) { 
+                    // Check if there's any segment *after* the current batch's last segment,
+                    // even if it wouldn't form a full new batch. This handles the tail end.
+                    // This logic might be redundant if collectedSegmentParameters covers all timedSegments.
+                    // However, if collectedSegmentParameters is built differently, this is a safeguard.
+                    // For safety, we primarily rely on collectedSegmentParameters for batching.
+                    // The more direct approach is to check based on original indices.
+                    // Let's find the segment in `timedSegments` that immediately follows `timedSegments[lastSegmentOriginalIndex]`
+                    if (lastSegmentOriginalIndex + 1 < timedSegments.length) {
+                        nextSegmentOriginalIndex = lastSegmentOriginalIndex + 1; // Assuming originalIndex aligns with timedSegments index
+                    }
+                }
+
+
+                if (nextSegmentOriginalIndex !== -1 && timedSegments[nextSegmentOriginalIndex]) {
+                    // End this chunk where the next relevant segment (start of next batch or immediate next segment) starts
+                    chunkGlobalEndTime = timedSegments[nextSegmentOriginalIndex].display_start_time;
+                    console.log(`Chunk ${chunkIndex}: Ends at start of next segment (${nextSegmentOriginalIndex}) @ ${chunkGlobalEndTime.toFixed(3)}s`);
+                } else {
+                    // This is the last batch of segments, or no clear next segment found.
+                    // Extend to the full audio duration to capture any trailing silence.
+                    chunkGlobalEndTime = audioDuration;
+                    console.log(`Chunk ${chunkIndex}: Last chunk or no next segment, extending to audio_duration: ${chunkGlobalEndTime.toFixed(3)}s`);
+                }
+                
+                // Ensure chunkGlobalEndTime is not before chunkGlobalStartTime and not beyond audioDuration.
+                // Also, ensure it's at least the end time of the last segment in the current batch.
+                chunkGlobalEndTime = Math.max(chunkGlobalEndTime, timedSegments[lastSegmentOriginalIndex].display_end_time);
+                chunkGlobalEndTime = Math.max(chunkGlobalStartTime + 0.01, chunkGlobalEndTime); // Ensure minimal positive duration for the chunk.
+                chunkGlobalEndTime = Math.min(chunkGlobalEndTime, audioDuration); // Cap at total audio duration.
+                // --- END MODIFIED chunkGlobalEndTime calculation ---
+                
                 // Duration for the black background should cover the visual elements of the chunk
-                const chunkVideoDuration = Math.max(0.1, timedSegments[lastSegmentOriginalIndex].display_end_time - chunkGlobalStartTime); 
+                // const chunkVideoDuration = Math.max(0.1, timedSegments[lastSegmentOriginalIndex].display_end_time - chunkGlobalStartTime); 
+                const chunkVideoDuration = Math.max(0.1, chunkGlobalEndTime - chunkGlobalStartTime); // UPDATED to use new chunkGlobalEndTime
                 
                 if (isNaN(chunkVideoDuration) || isNaN(chunkGlobalStartTime) || isNaN(chunkGlobalEndTime)) {
                      throw new Error(`Calculated timing is NaN for chunk ${chunkIndex}. Start: ${chunkGlobalStartTime}, End: ${chunkGlobalEndTime}, VidDur: ${chunkVideoDuration}`);
@@ -397,7 +437,7 @@ Initiating cleanup for request ${requestId}...`);
                     '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac',      // Encode audio for chunk
                     '-b:a', '128k',     // Standard bitrate
-                    '-shortest',        // Ensure output duration is trimmed to shortest input (audio segment)
+                    '-r', '60',         // Force frame rate for chunk
                     '-y',
                     chunkOutputPath
                 ];
@@ -457,6 +497,7 @@ Initiating cleanup for request ${requestId}...`);
                 '-map', audioMap,
                 ...videoCodecOpts, // Apply determined video codec options
                 ...audioCodecOpts, // Always apply audio encoding options
+                '-r', '60',          // Force frame rate for final output
                 '-movflags', '+faststart',
                 '-y',
                 outputVideoPath 
@@ -486,16 +527,16 @@ Initiating cleanup for request ${requestId}...`);
 
         // --- Send File (Common to both workflows) ---
         console.log(`Video generation complete: ${outputVideoPath}`);
-        res.sendFile(outputVideoPath, (err) => {
-             if (err) {
-                console.error('Error sending file:', err);
-                 if (!res.headersSent) {
-                     res.status(500).json({ error: 'Failed to send the generated video file.' });
-                 }
-             } else {
-                 console.log('Video file sent successfully.');
-             }
-        });
+            res.sendFile(outputVideoPath, (err) => {
+                if (err) {
+                    console.error('Error sending file:', err);
+                    if (!res.headersSent) {
+                         res.status(500).json({ error: 'Failed to send the generated video file.' });
+                    }
+                } else {
+                    console.log('Video file sent successfully.');
+                }
+            });
 
     } catch (error) {
         console.error('Error during video generation pipeline:', error);
@@ -510,11 +551,11 @@ Initiating cleanup for request ${requestId}...`);
         process.removeListener('SIGTERM', cleanupAndExit);
         process.removeListener('uncaughtException', cleanupAndExit);
         process.removeListener('unhandledRejection', cleanupAndExit);
-        
+
         console.log(`Starting final cleanup for request ${requestId}`);
         try {
             // Conditionally delete chunk files and concat list if chunking was used
-            if (USE_CHUNKING) {
+            if (USE_CHUNKING && false) { // Set to true to re-enable chunk deletion
                 for (const chunkRelPath of chunkOutputFilePaths) {
                     try {
                         await fs.unlink(path.join(tempDir, chunkRelPath));
@@ -532,10 +573,14 @@ Initiating cleanup for request ${requestId}...`);
                 }
             }
             
-            // Always attempt to remove the main temp directory
-            await fs.access(tempDir); 
-            await fs.rm(tempDir, { recursive: true, force: true });
-            console.log(`Successfully cleaned up temp directory: ${tempDir}`);
+            // Always attempt to remove the main temp directory *UNLESS* we are chunking (for debugging)
+            if (!USE_CHUNKING) { // Keep temp dir if chunking for debugging
+                await fs.access(tempDir); 
+                await fs.rm(tempDir, { recursive: true, force: true });
+                console.log(`Successfully cleaned up temp directory (Single-Command Mode): ${tempDir}`);
+            } else {
+                console.log(`Skipping temp directory cleanup (Chunking Mode for Debugging): ${tempDir}`);
+            }
         } catch (cleanupError) {
             if (cleanupError.code !== 'ENOENT') { // Ignore if dir already gone
                 console.error(`Error during final cleanup for ${requestId}:`, cleanupError);
@@ -698,14 +743,14 @@ function constructFfmpegCommand(options) {
 
     const collectedSegmentParameters = [];
 
-    // --- Inputs ---
+    // --- Inputs --- 
     imagePaths.forEach((imgPath) => {
         inputs.push('-i', imgPath);
     });
     inputs.push('-i', audioFilePath);
     ffmpegArgs.push(...inputs);
 
-    // --- Filter Complex ---
+    // --- Filter Complex --- 
     const baseCanvasTag = 'base';
     filterComplexParts.push(`color=black:s=${outputWidth}x${outputHeight}:d=${audioDuration}[${baseCanvasTag}]`);
 
@@ -764,7 +809,7 @@ function constructFfmpegCommand(options) {
         });
     });
 
-    // --- Subtitles ---
+    // --- Subtitles --- 
     let finalVideoOutputTag = lastOverlayOutput;
     if (subtitlesPath) {
         const subtitlesOutputTag = 'subtitled';
@@ -777,7 +822,7 @@ function constructFfmpegCommand(options) {
 
     ffmpegArgs.push('-filter_complex', filterComplexParts.join(';'));
 
-    // --- Output Mapping and Options ---
+    // --- Output Mapping and Options --- 
     ffmpegArgs.push(
         '-map', `[${finalVideoOutputTag}]`,
         '-map', `${imagePaths.length}:a`,
