@@ -527,6 +527,8 @@ Initiating cleanup for request ${requestId}...`);
 
         // --- Send File (Common to both workflows) ---
         console.log(`Video generation complete: ${outputVideoPath}`);
+            // Explicitly set the correct MIME type
+            res.setHeader('Content-Type', 'video/mp4'); 
             res.sendFile(outputVideoPath, (err) => {
                 if (err) {
                     console.error('Error sending file:', err);

@@ -158,6 +158,27 @@ async function downloadFile(url, destPath) {
   });
 }
 
+// Helper function to format a command and its arguments for shell execution
+function formatCommandForShell(commandName, argsArray) {
+  const formattedArgs = argsArray.map(arg => {
+    if (typeof arg === 'number') {
+      return arg.toString(); // Numbers are fine as is
+    }
+    if (typeof arg !== 'string') {
+      // This case should ideally not happen if args are prepared correctly
+      // but if it does, return an empty string or handle as an error.
+      console.warn(`formatCommandForShell encountered non-string/non-number arg: ${arg}`);
+      return ''; 
+    }
+    // For string arguments, wrap in double quotes.
+    // Escape characters that are special within double quotes for many shells: backslash, double quote, dollar sign.
+    // Add other characters like ` (backtick) if needed, depending on shell and context.
+    const escapedArg = arg.replace(/[\\"$`]/g, '\\$&'); // Escape \, ", $, `
+    return `"${escapedArg}"`;
+  });
+  return `${commandName} ${formattedArgs.join(' ')}`;
+}
+
 // --- Main Async Function ---
 async function main() {
   const newItem = {};
@@ -192,6 +213,11 @@ async function main() {
   const os = require("os");
   const crypto = require("crypto");
   const { URL } = require("url");
+  const fs = require('fs'); // <--- Added fs module
+
+  // --- Configuration for Chunking ---
+  const CHUNK_SIZE = 5; // Number of segments per chunk
+  const USE_CHUNKING = true; // Always true for this node
 
   // --- Setup Temp Dir ---
   const requestId = crypto.randomUUID();
@@ -208,37 +234,47 @@ async function main() {
     const audioBuffer = Buffer.from(inputData.audioInBase64, "base64");
     await fsPromises.writeFile(audioFilePath, audioBuffer);
     console.log(`Decoded audio saved to: ${audioFilePath}`);
-    newItem.json.audioFilePath = audioFilePath;
+    newItem.json.audioFilePath = audioFilePath; // Keep for reference
 
     // --- Get Audio Duration ---
     let audioDuration;
     try {
+      // Prefer ffprobe-like accurate duration if available, otherwise estimate
+      // For n8n, we'll rely on transcript or sum of durations.
+      // The server.js uses ffprobe, which is more accurate.
+      // This node will use the existing estimation method.
       const lastWord =
         inputData.transcript.length > 0
           ? inputData.transcript[inputData.transcript.length - 1]
           : null;
-      if (lastWord && typeof lastWord.end === "number") {
+      if (lastWord && typeof lastWord.end === "number" && lastWord.end > 0) {
         audioDuration = lastWord.end;
         console.log(
           `Using audio duration from transcript end time: ${audioDuration} seconds`
         );
       } else {
-        audioDuration = inputData.segments.reduce(
-          (sum, s) => sum + (parseFloat(s.durationOnScreen) || 5.0),
-          0
+        // Fallback: estimate from segment durations (less accurate but necessary if transcript is missing/bad)
+        let calculatedSum = inputData.segments.reduce(
+            (sum, s) => sum + (parseFloat(s.durationOnScreen) || 5.0), 0
         );
+        if (calculatedSum <= 0) { // Ensure a positive duration
+            console.warn("Calculated sum of segment durations is non-positive. Using default 10s.");
+            calculatedSum = 10.0;
+        }
+        audioDuration = calculatedSum;
         console.warn(
           `Estimating audio duration based on segment durations: ${audioDuration} seconds`
         );
       }
-      console.log(`Audio duration (determined): ${audioDuration} seconds`);
       if (
         typeof audioDuration !== "number" ||
         isNaN(audioDuration) ||
         audioDuration <= 0
       ) {
-        throw new Error(`Invalid audio duration calculated: ${audioDuration}`);
+        console.error(`Invalid audio duration calculated (${audioDuration}), defaulting to 10s.`);
+        audioDuration = 10.0; // Default to a sensible value if calculation fails
       }
+       console.log(`Audio duration (determined for timeline): ${audioDuration} seconds`);
     } catch (err) {
       console.error("Error determining audio duration:", err);
       throw new Error("Failed to determine a valid audio duration.");
@@ -246,7 +282,7 @@ async function main() {
 
     // --- 2. Download Images ---
     console.log("Starting image downloads...");
-    const downloadedImagePaths = [];
+    const downloadedImagePaths = []; // This will store absolute paths
     const downloadPromises = inputData.segments.map(async (segment, index) => {
       if (
         !segment.images ||
@@ -259,7 +295,7 @@ async function main() {
         );
       }
       const imageUrl = segment.images[0].url;
-      let extension = ".jpg";
+      let extension = ".jpg"; // Default extension
       try {
         const parsedUrl = new URL(imageUrl);
         const ext = path.extname(parsedUrl.pathname);
@@ -272,30 +308,35 @@ async function main() {
         );
       }
       const imageFileName = `image_${index}${extension}`;
-      const localImagePath = path.join(tempDir, imageFileName);
+      const localImagePath = path.join(tempDir, imageFileName); // Absolute path
       console.log(
         `Downloading image ${index}: ${imageUrl} to ${localImagePath}`
       );
       await downloadFile(imageUrl, localImagePath);
       console.log(`Finished downloading image ${index}`);
-      downloadedImagePaths[index] = localImagePath;
+      downloadedImagePaths[index] = localImagePath; // Store absolute path
     });
     await Promise.all(downloadPromises);
     console.log("All images downloaded successfully.");
-    newItem.json.imageLocalPaths = downloadedImagePaths;
+    // newItem.json.imageLocalPaths = downloadedImagePaths; // Will be part of ffmpegProcessingDetails
 
-    // --- 3. Calculate Timeline (Logic from server.js) ---
+    // --- 3. Calculate Timeline (Logic from server.js, durationMode always 'dynamic') ---
     const timedSegments = [];
-    const defaultFixedDuration = 5.0;
-    const minVisualDuration = 0.1; // Define minVisualDuration
-    const transcript = inputData.transcript;
-    const segments = inputData.segments;
+    const defaultFixedDuration = 5.0; // Fallback for a segment if dynamic fails
+    const minVisualDuration = 0.1;
+    const transcript = inputData.transcript; // Already validated
+    const segments = inputData.segments;     // Already validated
+    const outputWidth = inputData.outputWidth || 1920;
+    const outputHeight = inputData.outputHeight || 1080;
+    const fps = inputData.fps || 60;
 
-    // --- Pass 1: Pre-calculate dynamic timings ---
-    console.log("--- Pre-calculating Dynamic Timings ---");
+
+    // --- Pass 1: Pre-calculate dynamic timings (durationMode is always 'dynamic') ---
+    console.log("--- Pre-calculating Dynamic Timings (mode: dynamic) ---");
     const dynamicTimings = segments.map((segment, i) => {
-        const durationMode = (segment.durationMode || inputData.durationMode || 'fixed'); // Use inputData.durationMode
-        if (durationMode === 'dynamic' && segment.textOnScreen) {
+        // const durationMode = (segment.durationMode || inputData.durationMode || 'fixed'); // Use inputData.durationMode
+        // For this node, durationMode is considered 'dynamic'
+        if (segment.textOnScreen) { // textOnScreen is required for dynamic
             const wordSequence = findWordSequence(transcript, segment.textOnScreen);
             if (wordSequence) {
                 console.log(`Segment ${i} (dynamic-precalc): Found text. Start=${wordSequence.startTime.toFixed(3)}, End=${wordSequence.endTime.toFixed(3)}`);
@@ -305,12 +346,13 @@ async function main() {
                     endTime: wordSequence.endTime,
                     speechDuration: wordSequence.duration
                 };
-            } else {
-                console.warn(`Segment ${i} (dynamic-precalc): Could not find text \"${segment.textOnScreen}\".`);
-                return { dynamicSuccess: false };
+            } else { // Dynamic mode failed for this segment
+                console.warn(`Segment ${i} (dynamic-precalc): Could not find text \"${segment.textOnScreen}\". Will use fixed fallback.`);
+                return { dynamicSuccess: false, speechDuration: defaultFixedDuration }; // Fallback duration
             }
-        } else {
-            return { dynamicSuccess: false }; // Mark as not dynamic or missing text
+        } else { // No textOnScreen, cannot be dynamic
+             console.warn(`Segment ${i} (dynamic-precalc): No textOnScreen provided. Will use fixed fallback.`);
+            return { dynamicSuccess: false, speechDuration: defaultFixedDuration }; // Fallback duration
         }
     });
 
@@ -320,211 +362,322 @@ async function main() {
     for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
         const precalc = dynamicTimings[i];
-        const durationMode = (segment.durationMode || inputData.durationMode || 'fixed'); // Use inputData.durationMode
+        // const durationMode = (segment.durationMode || inputData.durationMode || 'fixed');
+        // Duration mode is treated as dynamic with fallback here.
         
         let segmentTiming = {
             display_start_time: 0,
             display_end_time: 0,
             effective_visual_duration: 0,
-            speech_duration: 0,
+            speech_duration: 0, // Will be set based on precalc or fallback
             index: i
         };
 
         if (precalc.dynamicSuccess) {
             segmentTiming.display_start_time = Math.max(videoTime, precalc.startTime);
-            // Ensure end time is at least minVisualDuration after the start, and respects dynamic end
             segmentTiming.display_end_time = Math.max(segmentTiming.display_start_time + minVisualDuration, precalc.endTime);
             segmentTiming.speech_duration = precalc.speechDuration;
-            console.log(`Segment ${i} (dynamic-placed): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}`);
-        } else { // Fixed mode or dynamic fallback
-            const fixedDuration = parseFloat(segment.durationOnScreen) || defaultFixedDuration;
+            // console.log(`Segment ${i} (dynamic-placed): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}`);
+        } else { // Fallback for this segment (dynamic failed or no text)
+            const fixedDuration = precalc.speechDuration; // Use the fallback duration from precalc
             segmentTiming.display_start_time = videoTime;
             segmentTiming.display_end_time = videoTime + fixedDuration;
             segmentTiming.speech_duration = fixedDuration;
-            console.log(`Segment ${i} (${durationMode}-placed): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}`);
+            // console.log(`Segment ${i} (fixed-fallback-placed): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}`);
         }
 
         segmentTiming.effective_visual_duration = Math.max(minVisualDuration, segmentTiming.display_end_time - segmentTiming.display_start_time);
-        // Ensure end time is correctly set after visual duration is potentially clamped by minVisualDuration
         segmentTiming.display_end_time = segmentTiming.display_start_time + segmentTiming.effective_visual_duration;
 
-        // --- Adjust LAST segment --- 
-        if (i === segments.length - 1) {
-             // Clamp the end time to the audio duration first
+        if (i === segments.length - 1) { // Adjust LAST segment
              segmentTiming.display_end_time = Math.min(segmentTiming.display_end_time, audioDuration);
-             // Extend the end time if it's shorter than the audio
             if (segmentTiming.display_end_time < audioDuration) {
                  console.log(`Adjusting last segment end time from ${segmentTiming.display_end_time.toFixed(3)} to ${audioDuration.toFixed(3)}`);
                  segmentTiming.display_end_time = audioDuration;
              }
-             // Recalculate final visual duration
              segmentTiming.effective_visual_duration = Math.max(minVisualDuration, segmentTiming.display_end_time - segmentTiming.display_start_time);
-             // Update speech duration if it wasn't dynamically set
-             if (!precalc.dynamicSuccess) {
+             if (!precalc.dynamicSuccess) { // If it was a fallback, ensure speech_duration matches visual
                  segmentTiming.speech_duration = segmentTiming.effective_visual_duration;
              }
         }
 
         timedSegments.push(segmentTiming);
-        videoTime = segmentTiming.display_end_time; // Update video time for the next iteration
+        videoTime = segmentTiming.display_end_time;
         console.log(`Segment ${i} (Final): Start=${segmentTiming.display_start_time.toFixed(3)}, End=${segmentTiming.display_end_time.toFixed(3)}, VisualDur=${segmentTiming.effective_visual_duration.toFixed(3)}, SpeechDur=${segmentTiming.speech_duration.toFixed(3)}`);
     }
-    // Overlap correction loop removed as the new sequential placement logic should handle this better.
-    newItem.json.timedSegments = timedSegments;
+    // newItem.json.timedSegments = timedSegments; // Will be part of ffmpegProcessingDetails
 
     // --- 4. Generate Subtitles ---
-    const subtitlesPath = path.join(tempDir, "subtitles.ass");
+    const subtitlesFileName = "subtitles.ass";
+    const subtitlesPath = path.join(tempDir, subtitlesFileName); // Absolute path
     let subtitlesExist = false;
-    if (inputData.transcript.length > 0) {
+    if (inputData.transcript && inputData.transcript.length > 0) {
       try {
-        const assContent = generateAssSubtitles(transcript);
+        const assContent = generateAssSubtitles(transcript); // transcript is already defined
         await fsPromises.writeFile(subtitlesPath, assContent);
         console.log(`Generated ASS subtitles: ${subtitlesPath}`);
-        newItem.json.subtitlesFilePath = subtitlesPath;
+        // newItem.json.subtitlesFilePath = subtitlesPath; // Part of details
         subtitlesExist = true;
       } catch (subError) {
         console.error("Error generating subtitles:", subError);
         console.warn("Proceeding without subtitles due to generation error.");
-        newItem.json.subtitlesFilePath = null;
+        // newItem.json.subtitlesFilePath = null;
       }
     } else {
-      console.log("Transcript is empty, skipping subtitle generation.");
-      newItem.json.subtitlesFilePath = null;
+      console.log("Transcript is empty or not provided, skipping subtitle generation.");
+      // newItem.json.subtitlesFilePath = null;
     }
 
-    // --- 5. Construct FFmpeg Command Arguments ---
-    const outputVideoPath = path.join(tempDir, "output.mp4");
-    const imagePaths = downloadedImagePaths;
-    const outputWidth = 1920;
-    const outputHeight = 1080;
-    const fadeDuration = 0.5;
-    const fps = 60;
-
-    const ffmpegArgs = []; // This will hold the arguments array
-    const inputs = [];
-    const filterComplexParts = [];
-
-    // --- Inputs ---
-    imagePaths.forEach((imgPath) => {
-      inputs.push("-i", imgPath);
-    });
-    inputs.push("-i", audioFilePath);
-    ffmpegArgs.push(...inputs);
-
-    // --- Filter Complex ---
-    const baseCanvasTag = "base";
-    // Using original color filter definition
-    filterComplexParts.push(
-      `color=black:s=${outputWidth}x${outputHeight}:d=${audioDuration}[${baseCanvasTag}]`
-    );
-    let lastOverlayOutput = baseCanvasTag;
-
+    // --- 5. Collect Segment Parameters for Chunking ---
+    // (Adapted from server.js constructFfmpegCommand)
+    const collectedSegmentParameters = [];
     timedSegments.forEach((segment, index) => {
-      const imgInputIndex = index;
-      const start = segment.display_start_time;
-      const visualDuration = segment.effective_visual_duration;
       const speechDuration = segment.speech_duration;
-      const zoompanTag = `zoompan${index}`;
-      const formatTag = `format${index}`;
-      const finalSegmentVideoTag = `v${index}`;
-
       const zoompanDurationSeconds = Math.max(0.1, speechDuration);
       const zoompanDurationFrames = Math.ceil(zoompanDurationSeconds * fps);
 
-      let zoompanX, zoompanY;
-      if (index % 2 === 0) {
-        zoompanX = "0*(zoom-1)";
-        zoompanY = "ih-ih/zoom";
+      let rawZoompanX, rawZoompanY;
+      // Simple alternating zoom for variety, can be made more complex or configurable
+      if (index % 2 === 0) { 
+          rawZoompanX = '0*(zoom-1)'; 
+          rawZoompanY = '0*(zoom-1)'; 
       } else {
-        zoompanX = "iw-iw/zoom";
-        zoompanY = "0";
+          rawZoompanX = 'iw-iw/zoom'; 
+          rawZoompanY = 'ih-ih/zoom'; 
       }
+      // A common zoom expression: slowly zoom in up to 1.5x
+      const rawZoomExpression = 'if(eq(on,1),1,min(zoom+0.0010,1.5))';
 
-      const zoomExpression = "if(eq(on,1),1,min(zoom+0.0010,1.5))";
-      const zoompanFilter = `zoompan=z='${zoomExpression}':x='${zoompanX}':y='${zoompanY}':d=${zoompanDurationFrames}:s=${outputWidth}x${outputHeight}:fps=${fps}`;
-
-      filterComplexParts.push(
-        `[${imgInputIndex}:v]${zoompanFilter}[${zoompanTag}]`,
-        `[${zoompanTag}]format=pix_fmts=yuva420p[${formatTag}]`
-      );
-
-      filterComplexParts.push(
-        `[${formatTag}]setpts=PTS-STARTPTS+${start}/TB[${finalSegmentVideoTag}]`
-      );
-
-      const currentOverlayOutput = `ovl${index}`;
-      const overlayFormat =
-        index === timedSegments.length - 1 ? ":format=yuv420" : "";
-      filterComplexParts.push(
-        `[${lastOverlayOutput}][${finalSegmentVideoTag}]overlay=shortest=0:x=0:y=0${overlayFormat}[${currentOverlayOutput}]`
-      );
-      lastOverlayOutput = currentOverlayOutput;
+      collectedSegmentParameters.push({
+          originalIndex: index,
+          imagePath: downloadedImagePaths[index], // Absolute path
+          // Store raw expressions; shell escaping will be handled by formatCommandForShell
+          zoomExpression: rawZoomExpression,
+          zoompanX: rawZoompanX,
+          zoompanY: rawZoompanY,
+          zoompanDurationFrames: zoompanDurationFrames,
+          outputWidth: outputWidth,
+          outputHeight: outputHeight,
+          fps: fps,
+          displayStartTimeGlobal: segment.display_start_time,
+          effectiveVisualDurationGlobal: segment.effective_visual_duration,
+          speechDurationGlobal: segment.speech_duration,
+      });
     });
 
-    // --- Subtitles ---
-    let finalVideoOutputTag = lastOverlayOutput;
-    if (subtitlesExist) {
-      const subtitlesOutputTag = "subtitled";
-      const escapedSubsPath = subtitlesPath
-        .replace(/\\/g, "/")
-        .replace(/:/g, "\\:");
-      filterComplexParts.push(
-        `[${lastOverlayOutput}]ass=filename='${escapedSubsPath}'[${subtitlesOutputTag}]`
+    // --- 6. Generate FFmpeg Chunk Commands ---
+    const ffmpegChunkCommands = [];
+    const chunkOutputFilePaths = []; // Relative paths for concat list, absolute for command
+
+    if (!collectedSegmentParameters || collectedSegmentParameters.length === 0) {
+        throw new Error("No segment parameters collected for chunk processing.");
+    }
+    
+    for (let i = 0; i < collectedSegmentParameters.length; i += CHUNK_SIZE) {
+        const batch = collectedSegmentParameters.slice(i, i + CHUNK_SIZE);
+        if (batch.length === 0) continue;
+
+        const chunkIndex = Math.floor(i / CHUNK_SIZE);
+        const chunkOutputFileName = `video_chunk_${chunkIndex}.mp4`;
+        const chunkOutputPath = path.join(tempDir, chunkOutputFileName); // Absolute path
+        console.log(`Preparing chunk ${chunkIndex}... Output: ${chunkOutputPath}`);
+
+        const chunkImageInputs = [];
+        const chunkFilterComplexParts = [];
+        
+        const firstSegmentOriginalIndex = batch[0].originalIndex;
+        const lastSegmentOriginalIndex = batch[batch.length - 1].originalIndex;
+
+        if (timedSegments[firstSegmentOriginalIndex] === undefined || timedSegments[lastSegmentOriginalIndex] === undefined) {
+            throw new Error(`Invalid segment index for chunk ${chunkIndex}. Cannot determine chunk start/end times from timedSegments.`);
+        }
+
+        const chunkGlobalStartTime = timedSegments[firstSegmentOriginalIndex].display_start_time;
+        let chunkGlobalEndTime;
+
+        let nextSegmentOriginalIndex = -1;
+        // Check if there's a segment that would start the *next* batch
+        if (i + CHUNK_SIZE < collectedSegmentParameters.length) {
+            nextSegmentOriginalIndex = collectedSegmentParameters[i + CHUNK_SIZE].originalIndex;
+        } 
+        // If not a full next batch, check if there's any segment *immediately after* the current batch's last segment.
+        // This covers the case where the last few segments don't form a full CHUNK_SIZE batch.
+        // We look directly into timedSegments for this, assuming originalIndex corresponds to timedSegments index.
+        else if (lastSegmentOriginalIndex + 1 < timedSegments.length) { 
+            nextSegmentOriginalIndex = lastSegmentOriginalIndex + 1; 
+        }
+
+        if (nextSegmentOriginalIndex !== -1 && timedSegments[nextSegmentOriginalIndex]) {
+            chunkGlobalEndTime = timedSegments[nextSegmentOriginalIndex].display_start_time;
+            console.log(`Chunk ${chunkIndex}: Ends at start of next segment (${nextSegmentOriginalIndex}) @ ${chunkGlobalEndTime.toFixed(3)}s (Preserving silence)`);
+      } else {
+            chunkGlobalEndTime = audioDuration; // Last chunk, extend to full audio duration
+            console.log(`Chunk ${chunkIndex}: Last chunk or no clear next segment, extending to audio_duration: ${chunkGlobalEndTime.toFixed(3)}s`);
+        }
+        
+        // Final clamping and validation for chunkGlobalEndTime
+        chunkGlobalEndTime = Math.max(chunkGlobalEndTime, timedSegments[lastSegmentOriginalIndex].display_end_time); // Must be at least the end of its last visual segment
+        chunkGlobalEndTime = Math.max(chunkGlobalStartTime + minVisualDuration, chunkGlobalEndTime); // Ensure minimal positive duration
+        chunkGlobalEndTime = Math.min(chunkGlobalEndTime, audioDuration); // Cap at total audio duration
+
+        const chunkVideoDuration = Math.max(minVisualDuration, chunkGlobalEndTime - chunkGlobalStartTime);
+        
+        if (isNaN(chunkVideoDuration) || isNaN(chunkGlobalStartTime) || isNaN(chunkGlobalEndTime) || chunkVideoDuration <=0) {
+             throw new Error(`Calculated timing is NaN or non-positive for chunk ${chunkIndex}. Start: ${chunkGlobalStartTime}, End: ${chunkGlobalEndTime}, VidDur: ${chunkVideoDuration}`);
+      }
+
+        batch.forEach((segmentParams) => { // segmentParams are from collectedSegmentParameters
+            chunkImageInputs.push('-i', segmentParams.imagePath); // Absolute image paths
+        });
+        
+        const audioInputIndex = chunkImageInputs.length / 2; 
+        chunkImageInputs.push('-ss', chunkGlobalStartTime.toFixed(6));
+        chunkImageInputs.push('-to', chunkGlobalEndTime.toFixed(6));
+        chunkImageInputs.push('-i', audioFilePath); // Absolute audio path
+
+        chunkFilterComplexParts.push(`color=black:s=${outputWidth}x${outputHeight}:d=${chunkVideoDuration.toFixed(6)}[base_chunk_${chunkIndex}]`);
+        let lastChunkOverlayOutput = `base_chunk_${chunkIndex}`;
+
+        batch.forEach((segmentParams, batchSegmentIndex) => {
+            const imgInputIndexInChunk = batchSegmentIndex; 
+            const segmentStartTimeInChunk = Math.max(0, segmentParams.displayStartTimeGlobal - chunkGlobalStartTime);
+            
+            const zoompanTag = `czp${chunkIndex}_${batchSegmentIndex}`;
+            const formatTag = `cfmt${chunkIndex}_${batchSegmentIndex}`;
+            const finalSegmentVideoTag = `cv${chunkIndex}_${batchSegmentIndex}`;
+
+            const zoompanFilter = `zoompan=z='${segmentParams.zoomExpression}':x='${segmentParams.zoompanX}':y='${segmentParams.zoompanY}':d=${segmentParams.zoompanDurationFrames}:s=${segmentParams.outputWidth}x${segmentParams.outputHeight}:fps=${segmentParams.fps}`;
+
+            chunkFilterComplexParts.push(
+                `[${imgInputIndexInChunk}:v]${zoompanFilter}[${zoompanTag}]`,
+                `[${zoompanTag}]format=pix_fmts=yuva420p[${formatTag}]`, // yuva420p for overlay transparency if needed
+                `[${formatTag}]setpts=PTS-STARTPTS+${segmentStartTimeInChunk.toFixed(6)}/TB[${finalSegmentVideoTag}]`
       );
-      finalVideoOutputTag = subtitlesOutputTag;
+
+            const currentChunkOverlayOutput = `covl${chunkIndex}_${batchSegmentIndex}`;
+            // Apply yuv420p format only to the very last overlay in the chain for this chunk for compatibility
+            // const overlayPixelFormat = (batchSegmentIndex === batch.length -1) ? ":format=yuv420p" : ""; // REMOVE THIS LINE
+
+            chunkFilterComplexParts.push(
+                `[${lastChunkOverlayOutput}][${finalSegmentVideoTag}]overlay=shortest=0:x=0:y=0[${currentChunkOverlayOutput}]`
+            );
+            lastChunkOverlayOutput = currentChunkOverlayOutput;
+        });
+
+        const ffmpegChunkArgs = [
+            ...chunkImageInputs,
+            '-filter_complex', chunkFilterComplexParts.join(';'),
+            '-map', `[${lastChunkOverlayOutput}]`,
+            '-map', `${audioInputIndex}:a`,
+            '-c:v', 'libx264',
+            '-preset', 'fast', 
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p', // This global option correctly sets the chunk output format
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-r', String(fps),
+            '-y',
+            chunkOutputPath // Absolute path for output
+        ];
+        
+        ffmpegChunkCommands.push({ args: ffmpegChunkArgs, outputChunkPath: chunkOutputPath, chunkIndex });
+        chunkOutputFilePaths.push(chunkOutputPath); // Store the absolute path
     }
 
-    // Add the filter_complex argument
-    const finalFilterComplexString = filterComplexParts.join(";");
-    ffmpegArgs.push("-filter_complex", finalFilterComplexString); // Add as separate argument
+    // --- Prepare Concatenation ---
+    const finalOutputFileName = 'final_output.mp4';
+    const finalOutputVideoPath = path.join(tempDir, finalOutputFileName); // Absolute path
+    const concatListFileName = 'concat_list.txt';
+    const concatListPath = path.join(tempDir, concatListFileName); // Absolute path
 
-    // --- Output Mapping and Options ---
-    ffmpegArgs.push(
-      "-map",
-      `[${finalVideoOutputTag}]`,
-      "-map",
-      `${imagePaths.length}:a`,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "fast",
-      "-crf",
-      "23",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
-      "-y",
-      outputVideoPath
-    );
+    // Generate content for concat_list.txt
+    let concatFileContent = "";
+    chunkOutputFilePaths.forEach(chunkPath => {
+        const relativeChunkPath = path.basename(chunkPath);
+        concatFileContent += `file '${relativeChunkPath}'\n`;
+    });
 
-    // **MODIFIED: Construct the final command string again**
-    const commandString =
-      "ffmpeg " +
-      ffmpegArgs
-        .map((arg) => {
-          // Use robust single-quoting for shell compatibility
-          if (typeof arg === "string") {
-            return `'${arg.replace(/'/g, "'\\''")}'`; // POSIX-compliant escaping
-          }
-          return arg;
-        })
-        .join(" ");
+    // *** Write the concat_list.txt file directly using Node.js fs ***
+    console.log(`Writing concat list to: ${concatListPath}`);
+    fs.writeFileSync(concatListPath, concatFileContent.trim()); // Write the file
+    console.log(`Content:\\n${concatFileContent.trim()}`);
+    // *** End writing concat_list.txt ***
 
-    console.log("Generated FFmpeg command:", commandString);
-    newItem.json.ffmpegCommand = commandString; // **Output the single command string**
+    // Generate args for the final concatenation command
+    const ffmpegConcatArgs = [
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', concatListPath,
+      '-filter_complex', `[0:v]ass=filename='${subtitlesPath}'[final_v]`,
+      '-map', '[final_v]',
+      '-map', '0:a',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-r', String(fps),
+      '-movflags', '+faststart',
+      '-y', finalOutputVideoPath
+    ];
 
-    // Keep other output paths for reference/cleanup
-    newItem.json.outputVideoPath = outputVideoPath;
-    newItem.json.tempDir = tempDir;
+    const ffmpegConcatenationCommand = { 
+        args: ffmpegConcatArgs 
+    };
+    
+    // --- 8. Generate sequence of command strings for execution ---
+    let singleCommandString = "";
+    if (ffmpegChunkCommands && ffmpegChunkCommands.length > 0) {
+        ffmpegChunkCommands.forEach(chunkCmd => {
+            const cmdStr = formatCommandForShell('ffmpeg', chunkCmd.args);
+            if (singleCommandString.length > 0) {
+                singleCommandString += " && ";
+            }
+            singleCommandString += cmdStr;
+        });
+    }
+
+    // Add the final concatenation command
+    if (ffmpegConcatenationCommand && ffmpegConcatenationCommand.args) {
+        const concatCmdStr = formatCommandForShell('ffmpeg', ffmpegConcatenationCommand.args);
+        if (singleCommandString.length > 0) {
+            singleCommandString += " && ";
+        }
+        singleCommandString += concatCmdStr;
+    }
+
+    // --- Construct final output for n8n ---
+    newItem.json.ffmpegProcessingDetails = {
+        isChunkingEnabled: USE_CHUNKING,
+        CHUNK_SIZE: CHUNK_SIZE,
+        tempDir: tempDir, // For cleanup or access by other nodes
+        audioFilePath: audioFilePath, // Absolute path
+        imageLocalPaths: downloadedImagePaths, // Array of absolute paths
+        subtitlesFilePath: subtitlesExist ? subtitlesPath : null, // Absolute path or null
+        subtitlesExist: subtitlesExist,
+        audioDuration: audioDuration,
+        timedSegments: timedSegments, // For inspection
+        collectedSegmentParameters: collectedSegmentParameters, // For inspection
+        chunkCommands: ffmpegChunkCommands, // Array of { args, outputChunkPath, chunkIndex }
+        concatenationCommand: ffmpegConcatenationCommand, // { args }
+        finalOutputVideoPath: finalOutputVideoPath, // Absolute path
+        commandsInSequence: singleCommandString, // Ensure this line is present
+        outputWidth: outputWidth,
+        outputHeight: outputHeight,
+        fps: fps
+    };
+    
+    // Cleanup of the old single command output if it exists
+    delete newItem.json.ffmpegCommand;
+    delete newItem.json.outputVideoPath; // Replaced by finalOutputVideoPath in details
+
   } catch (error) {
-    console.error("Error in n8n Code node:", error);
+    console.error("Error in n8n Code node (chunking workflow):", error);
     newItem.error = `FFmpeg Command Generation Failed: ${error.message}`;
     newItem.errorStack = error.stack;
+    // Ensure tempDir is passed even on error for potential manual cleanup
+    if (tempDir) newItem.json.tempDirOnError = tempDir;
   }
 
   return newItem;
