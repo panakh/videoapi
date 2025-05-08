@@ -4,10 +4,18 @@ const fs = require('fs/promises');
 const path = require('path');
 const { spawn } = require('child_process');
 const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const morgan = require('morgan'); // For request logging
+const { Readable } = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR_BASE = path.join(__dirname, 'temp');
+
+// --- Configuration ---
+const USE_CHUNKING = true; // Set to false to use the original single-command method
+const CHUNK_SIZE = 5;      // Number of segments per chunk (if USE_CHUNKING is true)
+// --- End Configuration ---
 
 console.log("Setting up express.json middleware...");
 app.use(express.json({ limit: '50mb' }));
@@ -26,7 +34,8 @@ app.post('/generate_video', async (req, res) => {
     console.log("Received request for /generate_video");
     const requestId = crypto.randomUUID();
     const tempDir = path.join(TEMP_DIR_BASE, requestId);
-    let ffmpegProcess;
+    let ffmpegProcess = null;
+    const chunkOutputFilePaths = [];
 
     const cleanupAndExit = async (exitCode = 1) => {
         console.log(`
@@ -268,15 +277,20 @@ Initiating cleanup for request ${requestId}...`);
         // requiring drastic start time shifts.
 
         // --- 4. Generate Subtitles --- 
-        const subtitlesPath = path.join(tempDir, 'subtitles.ass');
-        try {
-             // Use the root-level transcript
-             const assContent = generateAssSubtitles(transcript);
-             await fs.writeFile(subtitlesPath, assContent);
-             console.log(`Generated ASS subtitles: ${subtitlesPath}`);
-        } catch (subError) {
-             console.error("Error generating subtitles:", subError);
-             console.warn("Proceeding without subtitles due to generation error.");
+        let subtitlesPath = null;
+        if (transcript && transcript.length > 0) {
+            subtitlesPath = path.join(tempDir, 'subtitles.ass');
+            try {
+                 // Use the root-level transcript
+                 const assContent = generateAssSubtitles(transcript);
+                 await fs.writeFile(subtitlesPath, assContent);
+                 console.log(`Generated ASS subtitles: ${subtitlesPath}`);
+            } catch (subError) {
+                 console.error("Error generating subtitles:", subError);
+                 console.warn("Proceeding without subtitles due to generation error.");
+            }
+        } else {
+            console.log("No transcript data found, skipping subtitle generation.");
         }
 
         const outputVideoPath = path.join(tempDir, 'output.mp4');
@@ -286,68 +300,248 @@ Initiating cleanup for request ${requestId}...`);
             subtitlesPath,
             outputPath: outputVideoPath,
             timedSegments,
-            audioDuration
+            audioDuration,
+            outputWidth: req.body.outputWidth || 1920,
+            outputHeight: req.body.outputHeight || 1080
         };
         
-        const { command, args } = constructFfmpegCommand(ffmpegCommandOptions);
+        const { command, args, collectedSegmentParameters } = constructFfmpegCommand(ffmpegCommandOptions);
 
-        console.log("Starting FFmpeg process...");
-        try {
-            const { process, commandPromise } = await runCommand(command, args, { cwd: tempDir });
-            ffmpegProcess = process;
-            const { stdout, stderr, code } = await commandPromise;
-            console.log("FFmpeg process finished.");
-             if (code !== 0) {
-                 throw new Error(`FFmpeg exited with code ${code}. Check server logs for stderr.`);
-             }
+        if (USE_CHUNKING) {
+            // --- Chunking Workflow ---
+            console.log("Using chunking workflow.");
 
-            console.log(`Video generated successfully: ${outputVideoPath}`);
-            res.sendFile(outputVideoPath, (err) => {
-                if (err) {
-                    console.error('Error sending file:', err);
-                    if (!res.headersSent) {
-                         res.status(500).json({ error: 'Failed to send the generated video file.' });
-                    }
-                } else {
-                    console.log('Video file sent successfully.');
+            if (!collectedSegmentParameters || collectedSegmentParameters.length === 0) {
+                throw new Error("No segment parameters collected for chunk processing.");
+            }
+
+            // --- 1. Generate A/V Chunks ---
+            for (let i = 0; i < collectedSegmentParameters.length; i += CHUNK_SIZE) {
+                const batch = collectedSegmentParameters.slice(i, i + CHUNK_SIZE);
+                if (batch.length === 0) continue;
+
+                const chunkIndex = i / CHUNK_SIZE;
+                const chunkOutputFileName = `video_chunk_${chunkIndex}.mp4`;
+                const chunkOutputPath = path.join(tempDir, chunkOutputFileName);
+                console.log(`Processing chunk ${chunkIndex}... Output: ${chunkOutputPath}`);
+
+                const chunkImageInputs = [];
+                const chunkFilterComplexParts = [];
+                
+                if (!timedSegments || timedSegments.length === 0) {
+                    throw new Error("timedSegments is not available for chunk processing.");
                 }
-            });
+                
+                const firstSegmentOriginalIndex = batch[0].originalIndex;
+                const lastSegmentOriginalIndex = batch[batch.length - 1].originalIndex;
 
-        } catch (ffmpegError) {
-            console.error('Error during FFmpeg execution:', ffmpegError);
-            if (ffmpegProcess && !ffmpegProcess.killed) {
-                ffmpegProcess.kill('SIGKILL'); 
+                if (timedSegments[firstSegmentOriginalIndex] === undefined || timedSegments[lastSegmentOriginalIndex] === undefined) {
+                    throw new Error(`Invalid segment index for chunk ${chunkIndex}. Cannot determine chunk start/end times.`);
+                }
+
+                const chunkGlobalStartTime = timedSegments[firstSegmentOriginalIndex].display_start_time;
+                // Use the end time of the *last* segment in the batch for audio end time
+                const chunkGlobalEndTime = timedSegments[lastSegmentOriginalIndex].display_end_time; 
+                // Duration for the black background should cover the visual elements of the chunk
+                const chunkVideoDuration = Math.max(0.1, timedSegments[lastSegmentOriginalIndex].display_end_time - chunkGlobalStartTime); 
+                
+                if (isNaN(chunkVideoDuration) || isNaN(chunkGlobalStartTime) || isNaN(chunkGlobalEndTime)) {
+                     throw new Error(`Calculated timing is NaN for chunk ${chunkIndex}. Start: ${chunkGlobalStartTime}, End: ${chunkGlobalEndTime}, VidDur: ${chunkVideoDuration}`);
+                }
+
+                // Add image inputs
+                batch.forEach((segmentParams) => {
+                    chunkImageInputs.push('-i', segmentParams.imagePath);
+                });
+                // Add audio input for the specific time range
+                const audioInputIndex = chunkImageInputs.length / 2; // Inputs are added in pairs ('-i', path)
+                chunkImageInputs.push('-ss', chunkGlobalStartTime.toFixed(6)); // Use precise start time
+                chunkImageInputs.push('-to', chunkGlobalEndTime.toFixed(6));   // Use precise end time
+                chunkImageInputs.push('-i', audioFilePath);
+
+                // Filter complex setup
+                chunkFilterComplexParts.push(`color=black:s=${batch[0].outputWidth}x${batch[0].outputHeight}:d=${chunkVideoDuration.toFixed(6)}[base_chunk_${chunkIndex}]`);
+                let lastChunkOverlayOutput = `base_chunk_${chunkIndex}`;
+
+                batch.forEach((segmentParams, batchSegmentIndex) => {
+                    const imgInputIndexInChunk = batchSegmentIndex; 
+                    const segmentStartTimeInChunk = Math.max(0, segmentParams.displayStartTimeGlobal - chunkGlobalStartTime);
+                    
+                    const zoompanTag = `czp${chunkIndex}_${batchSegmentIndex}`;
+                    const formatTag = `cfmt${chunkIndex}_${batchSegmentIndex}`;
+                    const finalSegmentVideoTag = `cv${chunkIndex}_${batchSegmentIndex}`;
+
+                    const zoompanFilter = `zoompan=z='${segmentParams.zoomExpression}':x='${segmentParams.zoompanX}':y='${segmentParams.zoompanY}':d=${segmentParams.zoompanDurationFrames}:s=${segmentParams.outputWidth}x${segmentParams.outputHeight}:fps=${segmentParams.fps}`;
+                    
+                    chunkFilterComplexParts.push(
+                        `[${imgInputIndexInChunk}:v]${zoompanFilter}[${zoompanTag}]`,
+                        `[${zoompanTag}]format=pix_fmts=yuva420p[${formatTag}]`,
+                        `[${formatTag}]setpts=PTS-STARTPTS+${segmentStartTimeInChunk.toFixed(6)}/TB[${finalSegmentVideoTag}]`
+                    );
+
+                    const currentChunkOverlayOutput = `covl${chunkIndex}_${batchSegmentIndex}`;
+                    chunkFilterComplexParts.push(
+                        `[${lastChunkOverlayOutput}][${finalSegmentVideoTag}]overlay=shortest=0:x=0:y=0[${currentChunkOverlayOutput}]`
+                    );
+                    lastChunkOverlayOutput = currentChunkOverlayOutput;
+                });
+
+                const ffmpegChunkArgs = [
+                    ...chunkImageInputs,
+                    '-filter_complex', chunkFilterComplexParts.join(';'),
+                    '-map', `[${lastChunkOverlayOutput}]`, // Map final chunk video
+                    '-map', `${audioInputIndex}:a`,       // Map the corresponding audio segment
+                    '-c:v', 'libx264',
+                    '-preset', 'fast', 
+                    '-crf', '23',
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac',      // Encode audio for chunk
+                    '-b:a', '128k',     // Standard bitrate
+                    '-shortest',        // Ensure output duration is trimmed to shortest input (audio segment)
+                    '-y',
+                    chunkOutputPath
+                ];
+                
+                console.log(`Executing chunk ${chunkIndex} command: ffmpeg ${ffmpegChunkArgs.join(' ')}`);
+                const { commandPromise: chunkCommandPromise } = await runCommand('ffmpeg', ffmpegChunkArgs, { cwd: tempDir });
+                await chunkCommandPromise; 
+                console.log(`Chunk ${chunkIndex} generated successfully.`);
+                chunkOutputFilePaths.push(chunkOutputFileName); 
             }
-            if (!res.headersSent) {
-                res.status(500).json({ 
-                    error: 'Failed to generate video.', 
-                    details: ffmpegError.message, 
-                    stderr: ffmpegError.stderr
-                }); 
+
+            // --- 2. Concatenate A/V Chunks ---
+            console.log("All A/V chunks generated. Starting concatenation...");
+
+            if (chunkOutputFilePaths.length === 0) {
+                throw new Error("No video chunks were generated to concatenate.");
             }
+
+            const concatListPath = path.join(tempDir, 'concat_list.txt');
+            const concatFileContent = chunkOutputFilePaths.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n');
+            await fs.writeFile(concatListPath, concatFileContent);
+            console.log(`Generated concat list: ${concatListPath}`);
+
+            const ffmpegConcatArgs = [
+                '-f', 'concat', '-safe', '0', '-i', concatListPath, // Use absolute path again
+                '-i', audioFilePath // Keep absolute path for audio input
+            ];
+
+            const concatFilterComplexParts = [];
+            let videoMap = '[0:v]';
+            let audioMap = '[0:a]';
+            let videoCodecOpts = ['-c:v', 'copy']; // Default video codec
+            const audioCodecOpts = ['-c:a', 'aac', '-b:a', '128k']; // Always re-encode audio for compatibility
+
+            if (subtitlesPath) {
+                console.log("Applying subtitles during concatenation.");
+                const escapedSubsPath = subtitlesPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+                concatFilterComplexParts.push(`[0:v]ass='${escapedSubsPath}'[final_v]`);
+                concatFilterComplexParts.push(`[0:a]anull[final_a]`); // Pass audio through
+                videoMap = '[final_v]';
+                audioMap = '[final_a]';
+                ffmpegConcatArgs.push('-filter_complex', concatFilterComplexParts.join(';'));
+                // Re-encoding video is necessary when applying filters
+                videoCodecOpts = [
+                    '-c:v', 'libx264', 
+                    '-preset', 'fast',
+                    '-crf', '23',
+                    '-pix_fmt', 'yuv420p' // Ensure final pixel format
+                ];
+            } else {
+                console.log("No subtitles to apply, using video stream copy for concatenation.");
+                // No filter_complex needed if just copying video & re-encoding audio
+            }
+            
+            ffmpegConcatArgs.push(
+                '-map', videoMap,
+                '-map', audioMap,
+                ...videoCodecOpts, // Apply determined video codec options
+                ...audioCodecOpts, // Always apply audio encoding options
+                '-movflags', '+faststart',
+                '-y',
+                outputVideoPath 
+            );
+
+            console.log(`Executing concatenation command: ffmpeg ${ffmpegConcatArgs.join(' ')}`);
+            const { process: concatProcess, commandPromise: concatCommandPromise } = await runCommand('ffmpeg', ffmpegConcatArgs, { cwd: tempDir });
+            ffmpegProcess = concatProcess; // Assign for potential cleanup
+            
+            await concatCommandPromise;
+
+        } else {
+            // --- Original Single-Command Workflow ---
+            console.log("Using single-command workflow.");
+            // 'command' and 'args' were already generated by constructFfmpegCommand
+            if (!command || !args) {
+                 throw new Error("Failed to construct FFmpeg command arguments for single-command workflow.");
+            }
+            console.log(`Executing single command: ${command} ${args.join(' ')}`);
+            const { process, commandPromise } = await runCommand(command, args, { cwd: tempDir });
+            ffmpegProcess = process; // Assign for potential cleanup
+
+            const { /* stdout, stderr, code */ } = await commandPromise;
+            // Error handling is implicitly done by the promise rejection in runCommand
+            console.log("FFmpeg process finished for single command.");
         }
+
+        // --- Send File (Common to both workflows) ---
+        console.log(`Video generation complete: ${outputVideoPath}`);
+        res.sendFile(outputVideoPath, (err) => {
+             if (err) {
+                console.error('Error sending file:', err);
+                 if (!res.headersSent) {
+                     res.status(500).json({ error: 'Failed to send the generated video file.' });
+                 }
+             } else {
+                 console.log('Video file sent successfully.');
+             }
+        });
 
     } catch (error) {
-        console.error(`Error processing request ${requestId}:`, error);
+        console.error('Error during video generation pipeline:', error);
+        // Ensure cleanup runs even on pipeline error before responding
+        await cleanupAndExit(1); 
         if (!res.headersSent) {
-            res.status(500).json({ error: 'Internal server error during video generation.', details: error.message });
+            res.status(500).json({ error: 'Video generation failed.', details: error.message });
         }
     } finally {
+        // Remove signal handlers
         process.removeListener('SIGINT', cleanupAndExit);
         process.removeListener('SIGTERM', cleanupAndExit);
         process.removeListener('uncaughtException', cleanupAndExit);
         process.removeListener('unhandledRejection', cleanupAndExit);
-
+        
         console.log(`Starting final cleanup for request ${requestId}`);
         try {
+            // Conditionally delete chunk files and concat list if chunking was used
+            if (USE_CHUNKING) {
+                for (const chunkRelPath of chunkOutputFilePaths) {
+                    try {
+                        await fs.unlink(path.join(tempDir, chunkRelPath));
+                        console.log(`Deleted chunk: ${chunkRelPath}`);
+                    } catch (unlinkErr) {
+                        // Log warning but continue cleanup
+                        console.warn(`Could not delete chunk ${chunkRelPath}: ${unlinkErr.message}`);
+                    }
+                }
+                try {
+                    await fs.unlink(path.join(tempDir, 'concat_list.txt'));
+                    console.log("Deleted concat_list.txt");
+                } catch (unlinkErr) {
+                     console.warn(`Could not delete concat_list.txt: ${unlinkErr.message}`);
+                }
+            }
+            
+            // Always attempt to remove the main temp directory
             await fs.access(tempDir); 
             await fs.rm(tempDir, { recursive: true, force: true });
             console.log(`Successfully cleaned up temp directory: ${tempDir}`);
         } catch (cleanupError) {
-            if (cleanupError.code !== 'ENOENT') { 
-                 console.error(`Error during final cleanup for ${requestId}:`, cleanupError);
+            if (cleanupError.code !== 'ENOENT') { // Ignore if dir already gone
+                console.error(`Error during final cleanup for ${requestId}:`, cleanupError);
             }
         }
+        console.log(`Request ${requestId} processing finished.`);
     }
 });
 
@@ -494,23 +688,24 @@ function constructFfmpegCommand(options) {
         timedSegments,
         audioDuration,
         outputWidth = 1920,
-        outputHeight = 1080,
-        fadeDuration = 0.5
+        outputHeight = 1080
     } = options;
 
     const ffmpegArgs = [];
     const inputs = [];
     const filterComplexParts = [];
-    const fps = 60; // Revert back to 60 fps
+    const fps = 60;
 
-    // --- Inputs --- 
-    imagePaths.forEach((imgPath, index) => {
+    const collectedSegmentParameters = [];
+
+    // --- Inputs ---
+    imagePaths.forEach((imgPath) => {
         inputs.push('-i', imgPath);
     });
     inputs.push('-i', audioFilePath);
     ffmpegArgs.push(...inputs);
 
-    // --- Filter Complex --- 
+    // --- Filter Complex ---
     const baseCanvasTag = 'base';
     filterComplexParts.push(`color=black:s=${outputWidth}x${outputHeight}:d=${audioDuration}[${baseCanvasTag}]`);
 
@@ -519,8 +714,6 @@ function constructFfmpegCommand(options) {
     timedSegments.forEach((segment, index) => {
         const imgInputIndex = index;
         const start = segment.display_start_time;
-        const end = segment.display_end_time;
-        const visualDuration = segment.effective_visual_duration;
         const speechDuration = segment.speech_duration;
         const zoompanTag = `zoompan${index}`;
         const formatTag = `format${index}`;
@@ -530,43 +723,48 @@ function constructFfmpegCommand(options) {
         const zoompanDurationFrames = Math.ceil(zoompanDurationSeconds * fps);
 
         let zoompanX, zoompanY;
-        // Alternate bottom-left (even) and top-right (odd)
-        if (index % 2 === 0) { // Even: Bottom-left
+        if (index % 2 === 0) {
             zoompanX = '0*(zoom-1)';
             zoompanY = 'ih-ih/zoom';
-        } else { // Odd: Top-right
+        } else {
             zoompanX = 'iw-iw/zoom';
             zoompanY = '0';
         }
-
-        // Use fps=60, explicit start zoom, and alternate panning
-        // Revert back to the recursive zoom expression which worked better
-        // Try a faster zoom rate
         const zoomExpression = 'if(eq(on,1),1,min(zoom+0.0010,1.5))';
         const zoompanFilter = `zoompan=z='${zoomExpression}':x='${zoompanX}':y='${zoompanY}':d=${zoompanDurationFrames}:s=${outputWidth}x${outputHeight}:fps=${fps}`;
         
-        // Simplify filter chain: input -> zoompan -> format -> setpts
         filterComplexParts.push(
-            `[${imgInputIndex}:v]${zoompanFilter}[${zoompanTag}]`, // Zoompan direct input
-            `[${zoompanTag}]format=pix_fmts=yuva420p[${formatTag}]` // Format for alpha directly after zoompan
+            `[${imgInputIndex}:v]${zoompanFilter}[${zoompanTag}]`,
+            `[${zoompanTag}]format=pix_fmts=yuva420p[${formatTag}]`
         );
-
-        // Set PTS after format filter (since fades are removed)
         filterComplexParts.push(
             `[${formatTag}]setpts=PTS-STARTPTS+${start}/TB[${finalSegmentVideoTag}]`
         );
 
-        // Chain the overlay filter
         const currentOverlayOutput = `ovl${index}`;
-        // Add format=yuv420 only to the *last* overlay
         const overlayFormat = (index === timedSegments.length - 1) ? ':format=yuv420' : '';
         filterComplexParts.push(
             `[${lastOverlayOutput}][${finalSegmentVideoTag}]overlay=shortest=0:x=0:y=0${overlayFormat}[${currentOverlayOutput}]`
         );
-        lastOverlayOutput = currentOverlayOutput; // Output of this overlay becomes input for the next
+        lastOverlayOutput = currentOverlayOutput;
+
+        collectedSegmentParameters.push({
+            originalIndex: index,
+            imagePath: imagePaths[index],
+            zoomExpression: zoomExpression,
+            zoompanX: zoompanX,
+            zoompanY: zoompanY,
+            zoompanDurationFrames: zoompanDurationFrames,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight,
+            fps: fps,
+            displayStartTimeGlobal: segment.display_start_time,
+            effectiveVisualDurationGlobal: segment.effective_visual_duration,
+            speechDurationGlobal: segment.speech_duration,
+        });
     });
 
-    // --- Subtitles --- 
+    // --- Subtitles ---
     let finalVideoOutputTag = lastOverlayOutput;
     if (subtitlesPath) {
         const subtitlesOutputTag = 'subtitled';
@@ -579,7 +777,7 @@ function constructFfmpegCommand(options) {
 
     ffmpegArgs.push('-filter_complex', filterComplexParts.join(';'));
 
-    // --- Output Mapping and Options --- 
+    // --- Output Mapping and Options ---
     ffmpegArgs.push(
         '-map', `[${finalVideoOutputTag}]`,
         '-map', `${imagePaths.length}:a`,
@@ -588,14 +786,13 @@ function constructFfmpegCommand(options) {
         '-crf', '23',
         '-c:a', 'aac',
         '-b:a', '128k',
-        // Set final pix_fmt here, after overlays and subtitles
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         '-y',
         outputPath
     );
 
-    return { command: 'ffmpeg', args: ffmpegArgs };
+    return { command: 'ffmpeg', args: ffmpegArgs, collectedSegmentParameters };
 }
 
 async function runCommand(command, args, options = {}) {
